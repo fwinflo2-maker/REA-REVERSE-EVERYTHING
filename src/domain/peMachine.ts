@@ -96,7 +96,14 @@ export const readPeOptionalHeader = (
   const parsed = readPeOptionalHeaderStructure(optionalHeader);
   if (!parsed.ok)
     return err({ kind: parsed.error.kind, message: parsed.error.message });
-  const facts = parsed.value;
+  return peOptionalHeaderFacts(parsed.value, machineType);
+};
+
+/** Decode machine identity from an optional header whose structure is already read. */
+export const peOptionalHeaderFacts = (
+  facts: PeOptionalHeaderStructure,
+  machineType: number,
+): Result<PeOptionalHeaderFacts, PeHeaderFailure> => {
   const cli = facts.dataDirectories[14];
   const managed = cli !== undefined && (cli.address !== 0 || cli.size !== 0);
   const decoded = decodePeMachine(machineType);

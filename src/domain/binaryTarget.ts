@@ -17,6 +17,7 @@ import {
   readPeOptionalHeaderFixedFields,
   readPeOptionalHeaderDirectory,
   readPeOptionalHeaderStructure,
+  type PeOptionalHeaderStructure,
 } from "./peOptionalHeader.js";
 import type { PeOptionalHeaderFacts } from "./peMachine.js";
 import { readPeCoffHeader } from "./peCoffHeader.js";
@@ -607,6 +608,7 @@ export const parsePeRecordStructure = (
     readonly machine: number;
     readonly characteristics: number;
     readonly optionalHeader: Buffer;
+    readonly optionalHeaderStructure: PeOptionalHeaderStructure;
   },
   string
 > => {
@@ -629,7 +631,12 @@ export const parsePeRecordStructure = (
   );
   const parsed = readPeOptionalHeaderStructure(optionalHeader);
   if (!parsed.ok) return err(parsed.error.message);
-  return ok({ machine, characteristics, optionalHeader });
+  return ok({
+    machine,
+    characteristics,
+    optionalHeader,
+    optionalHeaderStructure: parsed.value,
+  });
 };
 
 /** Parse a bounded PE signature, COFF record, and optional header without I/O. */

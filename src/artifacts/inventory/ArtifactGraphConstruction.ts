@@ -39,9 +39,11 @@ import {
   readFatContainerHeader,
 } from "../../domain/apple/machoContainer.js";
 import {
+  parseExecutableHeader,
   parsePeRecordStructure,
   readNativeHeaderFormat,
 } from "../../domain/binaryTarget.js";
+import { peOptionalHeaderFacts } from "../../domain/peMachine.js";
 
 /** Mutable internal occurrence used until root-bound IDs are known. */
 export interface MutableOccurrence {
@@ -225,8 +227,12 @@ export const createRootNode = (input: {
       } & ArtifactClassificationEvidence)
     | null;
   readonly occurrences: readonly MutableOccurrence[];
-}): ArtifactNode =>
-  createArtifactNode({
+}): ArtifactNode => {
+  const content: ArtifactContentClassification =
+    input.digest === null
+      ? withoutArchitecture("directory")
+      : classifyArtifactHeader(input.digest, input.digest.bytes);
+  return createArtifactNode({
     sha256:
       input.digest?.sha256 ??
       digestCanonicalValue(
@@ -244,17 +250,17 @@ export const createRootNode = (input: {
         "Artifact",
       ),
     size: input.digest?.bytes ?? 0,
-    format:
-      input.digest === null
-        ? "directory"
-        : classifyArtifactBytes(input.digest, input.digest.bytes),
+    format: content.format,
+    architecture: content.architecture,
     contentState: "materialized",
   });
+};
 
 export const createArtifactNode = (input: {
   readonly sha256: string;
   readonly size: number;
   readonly format: ArtifactNode["format"];
+  readonly architecture?: ArtifactNode["architecture"];
   readonly contentState: ArtifactNode["content_state"];
 }): ArtifactNode => ({
   artifact_id: artifactIdForContent(input.sha256),
@@ -262,7 +268,7 @@ export const createArtifactNode = (input: {
   sha256: input.sha256,
   size: input.size,
   media_type: null,
-  architecture: null,
+  architecture: input.architecture ?? null,
   content_state: input.contentState,
   limitations: [],
 });
@@ -553,9 +559,11 @@ export const classifyArtifactContent = (
   readonly kind: ArtifactOccurrence["artifact_kind"];
   readonly format: ArtifactOccurrence["artifact_format"];
   readonly contentFormat: ArtifactNode["format"];
+  readonly contentArchitecture: ArtifactNode["architecture"];
 } => {
   const { prefix, asarHeader } = evidence;
-  const contentFormat = classifyArtifactBytes(evidence, fileSize);
+  const content = classifyArtifactHeader(evidence, fileSize);
+  const contentFormat = content.format;
   const byPath = classifyArtifactPath(path);
   let role: ReturnType<typeof classifyArtifactPath>;
   if (
@@ -579,7 +587,7 @@ export const classifyArtifactContent = (
       role = { kind: "container", format: "asar" };
     else role = artifactRoleForFormat(path, contentFormat);
   } else role = artifactRoleForFormat(path, contentFormat);
-  return { ...role, contentFormat };
+  return { ...role, contentFormat, contentArchitecture: content.architecture };
 };
 
 const artifactRoleForFormat = (
@@ -609,7 +617,27 @@ const artifactRoleForFormat = (
 export const classifyArtifactBytes = (
   evidence: ArtifactClassificationEvidence,
   fileSize: number,
-): ArtifactNode["format"] => {
+): ArtifactNode["format"] => classifyArtifactHeader(evidence, fileSize).format;
+
+/** A content format and the CPU architecture its admitted header declares. */
+interface ArtifactContentClassification {
+  readonly format: ArtifactNode["format"];
+  readonly architecture: ArtifactNode["architecture"];
+}
+
+const withoutArchitecture = (
+  format: ArtifactNode["format"],
+): ArtifactContentClassification => ({ format, architecture: null });
+
+/**
+ * Classify storage bytes and read the architecture from the header that
+ * admitted the format. A universal Mach-O container declares several and, like
+ * non-executable content, reports none.
+ */
+export const classifyArtifactHeader = (
+  evidence: ArtifactClassificationEvidence,
+  fileSize: number,
+): ArtifactContentClassification => {
   const { prefix, suffix, mzWindowsHeaderSignature, mzWindowsHeaderRecord } =
     evidence;
   // A refused claim falls through: a header-only iNES region, for example,
@@ -628,30 +656,36 @@ export const classifyArtifactBytes = (
       recognition.state === "recognized" &&
       recognition.format !== "esp-flash-image"
     )
-      return recognition.format;
-  if (hasXmlPlistSignature(prefix)) return "plist";
+      return withoutArchitecture(recognition.format);
+  if (hasXmlPlistSignature(prefix)) return withoutArchitecture("plist");
   const fatFormat = classifyFatArtifact(evidence, fileSize);
-  if (fatFormat !== null) return fatFormat;
+  if (fatFormat !== null) return withoutArchitecture(fatFormat);
   // Admit ELF and thin Mach-O as target resolution does: a magic number
   // whose header does not decode is not an executable REA can open.
   const native = readNativeHeaderFormat(prefix, fileSize);
-  if (!native.ok) return "unknown";
-  if (native.value !== null) return native.value;
+  if (!native.ok) return withoutArchitecture("unknown");
+  if (native.value !== null)
+    return {
+      format: native.value,
+      architecture: nativeHeaderArchitecture(prefix, fileSize, native.value),
+    };
   if (prefix.length >= 2 && prefix[0] === 0x4d && prefix[1] === 0x5a) {
     if (
       !Number.isSafeInteger(fileSize) ||
       fileSize < prefix.length ||
       prefix.length < Math.min(fileSize, 64)
     )
-      return "unknown";
+      return withoutArchitecture("unknown");
     const mzEvidence = parseMzHeaderEvidence(
       prefix,
       fileSize,
       mzWindowsHeaderSignature,
     );
     const { windowsHeader } = mzEvidence;
-    if (windowsHeader.state === "signature-needed") return "unknown";
-    if (windowsHeader.state === "candidate") return "unknown";
+    if (windowsHeader.state === "signature-needed")
+      return withoutArchitecture("unknown");
+    if (windowsHeader.state === "candidate")
+      return withoutArchitecture("unknown");
     if (windowsHeader.state === "declared") {
       const windowsOffset = windowsHeader.offset;
       if (windowsHeader.signature === "PE" && windowsOffset >= 64) {
@@ -665,15 +699,48 @@ export const classifyArtifactBytes = (
             : undefined;
         const record =
           (observed?.length ?? 0) > (inline?.length ?? 0) ? observed : inline;
-        if (record !== undefined && parsePeRecordStructure(record).ok)
-          return "pe";
+        const structure =
+          record === undefined ? undefined : parsePeRecordStructure(record);
+        if (structure?.ok === true)
+          return {
+            format: "pe",
+            architecture: peStructureArchitecture(structure.value),
+          };
       }
-      return "unknown";
+      return withoutArchitecture("unknown");
     }
-    if (mzEvidence.dos.ok) return "dos-mz";
-    return "unknown";
+    // Target resolution reports a DOS MZ image as x86.
+    if (mzEvidence.dos.ok) return { format: "dos-mz", architecture: "x86" };
+    return withoutArchitecture("unknown");
   }
-  return "file";
+  return withoutArchitecture("file");
+};
+
+/** The CPU an admitted ELF or thin Mach-O header declares, as target resolution reads it. */
+const nativeHeaderArchitecture = (
+  prefix: Buffer,
+  fileSize: number,
+  format: "elf" | "mach-o",
+): ArtifactNode["architecture"] => {
+  // The host architecture only selects a universal Mach-O slice; these are thin.
+  const header = parseExecutableHeader(prefix, "x64", fileSize);
+  return header.ok && header.value.format === format
+    ? header.value.architecture
+    : null;
+};
+
+/** The CPU of a PE record whose structure classification admitted. */
+const peStructureArchitecture = (
+  structure: Extract<
+    ReturnType<typeof parsePeRecordStructure>,
+    { readonly ok: true }
+  >["value"],
+): ArtifactNode["architecture"] => {
+  const facts = peOptionalHeaderFacts(
+    structure.optionalHeaderStructure,
+    structure.machine,
+  );
+  return facts.ok ? (facts.value.machine?.architecture ?? null) : null;
 };
 
 const classifyFatArtifact = (
