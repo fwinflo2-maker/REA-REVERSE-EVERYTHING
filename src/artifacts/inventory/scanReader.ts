@@ -35,6 +35,7 @@ import {
 } from "../InesArtifactReader.js";
 import type { ArtifactNode } from "../../domain/artifactGraph.js";
 import {
+  artifactNodeArchitecture,
   classifyArtifactContent,
   classifyArtifactBytes,
   createArtifactNode,
@@ -478,6 +479,11 @@ const digestArtifactEntry = async (
       sha256: digest.sha256,
       size: digest.bytes,
       format: classified.contentFormat,
+      architecture: artifactNodeArchitecture(
+        digest,
+        classified.contentFormat,
+        digest.bytes,
+      ),
       contentState: "embedded",
     }),
     mismatched,

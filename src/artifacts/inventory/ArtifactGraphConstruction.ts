@@ -38,7 +38,10 @@ import {
   classifyFatContainerEvidence,
   readFatContainerHeader,
 } from "../../domain/apple/machoContainer.js";
-import { readNativeHeaderFormat } from "../../domain/binaryTarget.js";
+import {
+  parseExecutableHeader,
+  readNativeHeaderFormat,
+} from "../../domain/binaryTarget.js";
 
 /** Mutable internal occurrence used until root-bound IDs are known. */
 export interface MutableOccurrence {
@@ -222,8 +225,12 @@ export const createRootNode = (input: {
       } & ArtifactClassificationEvidence)
     | null;
   readonly occurrences: readonly MutableOccurrence[];
-}): ArtifactNode =>
-  createArtifactNode({
+}): ArtifactNode => {
+  const format =
+    input.digest === null
+      ? "directory"
+      : classifyArtifactBytes(input.digest, input.digest.bytes);
+  return createArtifactNode({
     sha256:
       input.digest?.sha256 ??
       digestCanonicalValue(
@@ -241,17 +248,20 @@ export const createRootNode = (input: {
         "Artifact",
       ),
     size: input.digest?.bytes ?? 0,
-    format:
+    format,
+    architecture:
       input.digest === null
-        ? "directory"
-        : classifyArtifactBytes(input.digest, input.digest.bytes),
+        ? null
+        : artifactNodeArchitecture(input.digest, format, input.digest.bytes),
     contentState: "materialized",
   });
+};
 
 export const createArtifactNode = (input: {
   readonly sha256: string;
   readonly size: number;
   readonly format: ArtifactNode["format"];
+  readonly architecture?: ArtifactNode["architecture"];
   readonly contentState: ArtifactNode["content_state"];
 }): ArtifactNode => ({
   artifact_id: artifactIdForContent(input.sha256),
@@ -259,7 +269,7 @@ export const createArtifactNode = (input: {
   sha256: input.sha256,
   size: input.size,
   media_type: null,
-  architecture: null,
+  architecture: input.architecture ?? null,
   content_state: input.contentState,
   limitations: [],
 });
@@ -664,6 +674,28 @@ export const classifyArtifactBytes = (
     return "unknown";
   }
   return "file";
+};
+
+/**
+ * The single CPU architecture a node's executable header declares. A universal
+ * Mach-O container declares several and, like non-executable content, has none.
+ */
+export const artifactNodeArchitecture = (
+  evidence: ArtifactClassificationEvidence,
+  format: ArtifactNode["format"],
+  fileSize: number,
+): ArtifactNode["architecture"] => {
+  if (!["elf", "mach-o", "pe", "dos-mz"].includes(format)) return null;
+  // The host architecture only selects a universal Mach-O slice, excluded above.
+  const header = parseExecutableHeader(
+    evidence.prefix,
+    "x64",
+    fileSize,
+    evidence.mzWindowsHeaderSignature,
+  );
+  return header.ok && header.value.format === format
+    ? header.value.architecture
+    : null;
 };
 
 const classifyFatArtifact = (
