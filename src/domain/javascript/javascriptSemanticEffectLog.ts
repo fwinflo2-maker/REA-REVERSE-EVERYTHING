@@ -40,6 +40,7 @@ import {
   semanticBindingLookupAt,
   type JavaScriptSemanticAnalysisState,
   type JavaScriptSemanticBindingState,
+  type JavaScriptSemanticMemberEffect,
   type JavaScriptSemanticReferenceEffectsAtSite,
 } from "./javascriptSemanticState.js";
 
@@ -586,6 +587,88 @@ export const prototypeMutationMayPrecede = (
       effect.owner === owner &&
       semanticEffectTiming(read, effect.node, state) !== "after",
   );
+
+/**
+ * Whether the `method` a read selects from `binding`'s object may have been
+ * replaced before the read: by direct eval that can reach the object (a const
+ * binding still exposes its properties), or by a write to the object, to
+ * `method` or to its prototype, or by an escape of the object or its
+ * prototype. Passing the method itself cannot replace its native [[Call]], and
+ * the call that receives the object has already selected the method.
+ * With `fresh`, the read's activation initialized the binding, so effects that
+ * follow the read in that body reach a different object. `targets` keeps the
+ * recorded effects that may reach the value the read selects.
+ */
+export const bindingMethodMayHaveChanged = (
+  binding: JavaScriptSemanticBindingState,
+  method: string,
+  read: t.Node,
+  state: JavaScriptSemanticAnalysisState,
+  {
+    fresh,
+    targets,
+  }: {
+    fresh: boolean;
+    targets: (effect: JavaScriptSemanticMemberEffect) => boolean;
+  },
+): boolean => {
+  // A prototype hop stays on the receiver chain. A constructor hop can
+  // return to that chain through .prototype. A wildcard may do either.
+  const reachesReceiver = (
+    path: JavaScriptSemanticPropertyPath,
+    length = path.length,
+    escape = false,
+  ) => {
+    let receiver = true;
+    let constructor = false;
+    for (let i = 0; i < length && (receiver || constructor); i++) {
+      const key = path[i]!;
+      const nextConstructor: boolean =
+        receiver && semanticPropertyPathKeyMatches(key, "constructor");
+      receiver =
+        (receiver && semanticPropertyPathKeyMatches(key, "__proto__")) ||
+        (constructor && semanticPropertyPathKeyMatches(key, "prototype"));
+      constructor = nextConstructor;
+    }
+    // The native constructor itself also exposes its mutable prototype.
+    return receiver || (escape && constructor);
+  };
+  const mayPrecede = (effect: t.Node | undefined): boolean =>
+    semanticEffectTiming(read, effect, state) !== "after" &&
+    !(
+      fresh &&
+      effect !== undefined &&
+      semanticBindingEffectFollowsRead(
+        binding,
+        read,
+        effect,
+        state.parentsByNode,
+      )
+    );
+  for (const effect of semanticOpaqueBindingEffects(
+    binding,
+    state,
+    "reference",
+  ))
+    if (mayPrecede(effect)) return true;
+  return (
+    binding.memberWrites.some(
+      (effect) =>
+        targets(effect) &&
+        (reachesReceiver(effect.path) ||
+          (semanticPropertyPathKeyMatches(effect.path.at(-1)!, method) &&
+            reachesReceiver(effect.path, effect.path.length - 1))) &&
+        mayPrecede(effect.node),
+    ) ||
+    binding.escapedPaths.some(
+      (effect) =>
+        targets(effect) &&
+        reachesReceiver(effect.path, effect.path.length, true) &&
+        effect.node !== state.parentsByNode.get(read) &&
+        mayPrecede(effect.node),
+    )
+  );
+};
 
 /** Whether a member write to `binding`'s object is recorded. */
 export const bindingHasMemberWrites = (

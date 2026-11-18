@@ -4,7 +4,7 @@ import { rejectsSemanticEventListener } from "./javascriptSemanticAsyncEffects.j
 import {
   BUILTIN_RESOURCE_SPECIFIERS,
   BUILTIN_RESOURCE_METHODS,
-  BUILTIN_RESOURCE_RELEASE_METHODS,
+  builtinResourceReleases,
 } from "./javascriptBuiltinResourceMethods.js";
 import type {
   JavaScriptSemanticCallable,
@@ -22,6 +22,7 @@ import {
 } from "./javascriptAstValues.js";
 import { isUnmodifiedGlobalReference } from "./javascriptSemanticGlobalReference.js";
 import {
+  bindingMethodMayHaveChanged,
   opaqueCodeMayRebindBinding,
   prototypeMutationMayPrecede,
 } from "./javascriptSemanticEffectLog.js";
@@ -30,6 +31,7 @@ import {
   resolveSemanticBindingState,
   type JavaScriptSemanticAnalysisState,
   type JavaScriptSemanticBindingState,
+  type JavaScriptSemanticMemberEffect,
 } from "./javascriptSemanticState.js";
 import {
   builtinDataEffectIdentity,
@@ -41,20 +43,6 @@ import {
 import { FS_OPEN_FLAGS, range } from "./javascriptStaticAnalysisHelpers.js";
 
 const RELEASE_METHODS = ["close", "destroy", "end"] as const;
-
-/**
- * Release methods the value from this acquisition actually has. An unlisted
- * specifier/method pair admits none, so a call to it emits no release fact.
- */
-const releaseMethodsFor = (
-  acquisition: ResourceCandidate,
-): readonly ("close" | "destroy" | "end")[] => {
-  const key = `${acquisition.specifier}:${acquisition.method}`;
-  const table: Readonly<
-    Record<string, readonly ("close" | "destroy" | "end")[]>
-  > = BUILTIN_RESOURCE_RELEASE_METHODS;
-  return table[key] ?? [];
-};
 
 interface ResourceCandidate {
   readonly builtinAuthority?: "candidate";
@@ -470,9 +458,13 @@ const collectReleases = (
         .filter(({ builtinAuthority }) => builtinAuthority === undefined)
         .map(({ node }) => node),
     );
+    const dependenciesFor = (acquisition: ResourceCandidate) =>
+      builtinResourceReleases(acquisition.specifier, acquisition.method)?.[
+        method
+      ];
     const linked = candidates.filter(
       (acquisition) =>
-        releaseMethodsFor(acquisition).includes(method) &&
+        dependenciesFor(acquisition) !== undefined &&
         (!acquisition.resultIsPromise ||
           opaqueReceiver ||
           mayReceiveFulfilledHandle(
@@ -485,6 +477,9 @@ const collectReleases = (
     // No linked acquisition exposes this release method, so the call is not a
     // release of it at all: Node throws at the call site instead.
     if (linked.length === 0) return;
+    const [first] = linked;
+    const dependencies =
+      linked.length === 1 && first ? dependenciesFor(first) : undefined;
     output.push({
       resourceId: `resource:release:${String(node.start ?? -1)}:${String(node.end ?? -1)}`,
       kind: "release",
@@ -498,7 +493,23 @@ const collectReleases = (
         : {}),
       resolution:
         !opaqueReceiver &&
-        linked.length === 1 &&
+        dependencies !== undefined &&
+        !releaseMethodMayHaveChanged(
+          binding,
+          method,
+          member,
+          context.state,
+          knownAcquisitions,
+        ) &&
+        !dependencies.some((dependency) =>
+          releaseMethodMayHaveChanged(
+            binding,
+            dependency,
+            node,
+            context.state,
+            knownAcquisitions,
+          ),
+        ) &&
         (binding.kind !== "parameter" ||
           semanticBindingAtRead(binding, member.object, context.state)
             .hasDefiniteInitializer) &&
@@ -508,6 +519,44 @@ const collectReleases = (
     });
   });
   return output;
+};
+
+/** Receiver identity alone cannot prove a release method survived mutation. */
+const releaseMethodMayHaveChanged = (
+  binding: JavaScriptSemanticBindingState,
+  method: string,
+  read: t.Node,
+  state: JavaScriptSemanticAnalysisState,
+  acquisitions: ReadonlySet<t.Node>,
+): boolean => {
+  const initializer = binding.initializers[0];
+  const fresh =
+    binding.initializers.length === 1 &&
+    initializer !== undefined &&
+    acquisitions.has(resourceInitializer(initializer.node).value);
+  const targetsAcquisition = (
+    effect: JavaScriptSemanticMemberEffect,
+  ): boolean => {
+    const capture = effect.receiverAt ?? effect.node;
+    if (capture === undefined) return true;
+    const selected = semanticBindingAtRead(binding, capture, state);
+    if (selected.status !== "ordered") return true;
+    // Empty incoming values cannot be the fresh acquisition selected later.
+    // Keep ambiguous aliases and projections unless the owner excludes them.
+    return [
+      ...selected.binding.initializers,
+      ...selected.binding.referenceInitializers,
+    ].some(
+      ({ node, projection }) =>
+        projection.length > 0 ||
+        !binding.initializers.some((source) => source.node === node) ||
+        acquisitions.has(resourceInitializer(node).value),
+    );
+  };
+  return bindingMethodMayHaveChanged(binding, method, read, state, {
+    fresh,
+    targets: targetsAcquisition,
+  });
 };
 
 /** Unwrap only direct awaits; a standalone await does not write its operand. */
